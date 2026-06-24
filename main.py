@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -11,12 +12,59 @@ from fetch_option_quotes import OptionChainData, get_option_data_for_symbol
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "csv"
+SUMMARY_CSV_PATH = DEFAULT_OUTPUT_DIR / "open_interest_summary.csv"
 
 UP_HEADERS = ["品种", "合约", "买量", "买价", "最新价", "卖价", "卖量", "持仓量", "涨跌", "行权价"]
 DOWN_HEADERS = ["品种", "合约", "买量", "买价", "最新价", "卖价", "卖量", "持仓量", "涨跌", "行权价"]
+SUMMARY_HEADERS = ["品种", "名称", "看涨持仓量", "看跌持仓量"]
 
 STRIKE_FROM_CONTRACT_RE = re.compile(r"[PC](\d+)$")
 PINZHONG_RE = re.compile(r"^([a-zA-Z]+)(\d+)$")
+
+
+@dataclass
+class ProductOpenInterest:
+    product: str
+    variety: str
+    name: str
+    call_open_interest: int = 0
+    put_open_interest: int = 0
+
+
+def parse_open_interest(value: str) -> int:
+    text = str(value).strip()
+    if text in ("", "-", "--"):
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def sum_chain_open_interest(chain: OptionChainData) -> tuple[int, int]:
+    call_total = sum(parse_open_interest(quote.open_interest) for quote in chain.calls)
+    put_total = sum(parse_open_interest(quote.open_interest) for quote in chain.puts)
+    return call_total, put_total
+
+
+def save_open_interest_summary_csv(
+    summaries: list[ProductOpenInterest],
+    output_path: Path = SUMMARY_CSV_PATH,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(SUMMARY_HEADERS)
+        for item in summaries:
+            writer.writerow([
+                item.variety,
+                item.name,
+                item.call_open_interest,
+                item.put_open_interest,
+            ])
+
+    return output_path
 
 
 def csv_base_name(product: str, pinzhong: str) -> str:
@@ -107,12 +155,21 @@ def batch_save_all_csv(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     session: requests.Session | None = None,
     timeout: float = 30,
-) -> list[tuple[Path, Path]]:
+) -> tuple[list[tuple[Path, Path]], Path]:
     sess = session or requests.Session()
     symbol_pinzhong_list = get_all_pinzhong_lists(session=sess, timeout=timeout)
 
     saved: list[tuple[Path, Path]] = []
+    summaries: list[ProductOpenInterest] = []
+
     for item in symbol_pinzhong_list:
+        variety, _ = parse_pinzhong(item.pinzhong_list[0])
+        summary = ProductOpenInterest(
+            product=item.symbol.code,
+            variety=variety,
+            name=item.symbol.name,
+        )
+
         for pinzhong in item.pinzhong_list:
             chain = get_option_data_for_symbol(
                 item.symbol,
@@ -122,16 +179,27 @@ def batch_save_all_csv(
             )
             saved.append(save_option_chain_csv(chain, output_dir=output_dir))
 
-    return saved
+            call_total, put_total = sum_chain_open_interest(chain)
+            summary.call_open_interest += call_total
+            summary.put_open_interest += put_total
+
+        summaries.append(summary)
+
+    summary_path = save_open_interest_summary_csv(
+        summaries,
+        output_path=output_dir / SUMMARY_CSV_PATH.name,
+    )
+    return saved, summary_path
 
 
 def main() -> None:
-    saved = batch_save_all_csv()
+    saved, summary_path = batch_save_all_csv()
     print(f"已保存 {len(saved)} 组 CSV 到 {DEFAULT_OUTPUT_DIR}")
     for up_path, down_path in saved[:3]:
         print(f"{up_path.name}, {down_path.name}")
     if len(saved) > 3:
         print(f"... 共 {len(saved)} 组")
+    print(f"已保存持仓量汇总到 {summary_path}")
 
 
 if __name__ == "__main__":
